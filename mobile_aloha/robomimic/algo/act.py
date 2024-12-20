@@ -53,7 +53,7 @@ class ACT(BC_VAE):
             self.proprio_dim += self.obs_key_shapes[k][0]
 
         from act.detr.main import build_ACT_model_and_optimizer
-        policy_config = {'num_queries': self.chunk_size,
+        policy_config = {'chunk_size': self.chunk_size,
                          'hidden_dim': self.algo_config.act.hidden_dim,
                          'dim_feedforward': self.algo_config.act.dim_feedforward,
                          'backbone': self.algo_config.act.backbone,

@@ -24,6 +24,11 @@ import IPython
 
 e = IPython.embed
 
+from utils.utils import get_gpu_mem_info
+
+def print_gpu_mem():
+    gpu_mem_total, gpu_mem_used, gpu_mem_free = get_gpu_mem_info()
+    return (gpu_mem_used/gpu_mem_total)*100
 
 def reparametrize(mu, logvar):
     std = logvar.div(2).exp()
@@ -45,100 +50,124 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
 
-    def __init__(self, backbones, depth_backbones, transformer, encoder, state_dim, num_queries, camera_names,
-                 kl_weight):
+    def __init__(self, backbones, depth_backbones, transformer, encoder, policy_config):
+
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
             transformer: torch module of the transformer architecture. See transformer.py
-            state_dim: robot state dimension of the environment
-            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
+            states_dim: robot state dimension of the environment
+            chunk_size: number of object queries, ie detection slot. This is the maximal number of objects
                          DETR can detect in a single image. For COCO, we recommend 100 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
         super().__init__()
-        self.num_queries = num_queries
-        self.camera_names = camera_names
+        self.chunk_size = policy_config.chunk_size
+        self.camera_names = policy_config.camera_names
+        self.states_dim = int(policy_config.states_dim)
+        
+        self.action_dim = policy_config.action_dim #  冗余输出
+        # print(f'{self.action_dim=}')
+        
+        self.kl_weight = policy_config.kl_weight
+        self.use_base = policy_config.use_base
+            
         self.transformer = transformer
         self.encoder = encoder
-        hidden_dim = transformer.d_model
-        action_dim = state_dim
+        self.hidden_dim = transformer.d_model
+        self.action_head = nn.Linear(self.hidden_dim, self.action_dim)
+        self.query_embed = nn.Embedding(self.chunk_size, self.hidden_dim)
         
-        self.action_head = nn.Linear(hidden_dim, action_dim)
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.kl_weight = kl_weight
-
+        # input_dim = 14 + 7 # robot_state + env_state
+        self.input_proj_left_state = nn.Linear(self.states_dim, self.hidden_dim)
+        self.input_proj_right_state = nn.Linear(self.states_dim, self.hidden_dim)
+        self.input_proj_robot_base = nn.Linear(3, self.hidden_dim)
+        self.input_proj_robot_head = nn.Linear(3, self.hidden_dim)
+        
         if backbones is not None:
             # print("backbones[0]", backbones[0])
             if depth_backbones is not None:
                 self.depth_backbones = nn.ModuleList(depth_backbones)
-                self.input_proj = nn.Conv2d(backbones[0].num_channels + depth_backbones[0].num_channels, hidden_dim,
+                self.input_proj = nn.Conv2d(backbones[0].num_channels + depth_backbones[0].num_channels, self.hidden_dim,
                                             kernel_size=1)
             else:
                 self.depth_backbones = None
-                self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
+                self.input_proj = nn.Conv2d(backbones[0].num_channels, self.hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
-            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
+
         else:
-            # input_dim = 14 + 7 # robot_state + env_state
-            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
-            self.pos = torch.nn.Embedding(2, hidden_dim)
+            self.pos = torch.nn.Embedding(2, self.hidden_dim)
             self.backbones = None
 
         # encoder extra parameters
         self.latent_dim = 32  # final size of latent z # TODO tune
-        self.cls_embed = nn.Embedding(1, hidden_dim)  # extra cls token embedding
+        self.cls_embed = nn.Embedding(1, self.hidden_dim)  # extra cls token embedding
 
         # decoder extra parameters
-        self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)  # project latent sample to embedding
-
-        self.latent_pos = nn.Embedding(1, hidden_dim)
-        self.robot_state_pos = nn.Embedding(1, hidden_dim)
+        self.latent_out_proj = nn.Linear(self.latent_dim, self.hidden_dim)  # project latent sample to embedding
+        self.latent_pos = nn.Embedding(1, self.hidden_dim)
         
+        pos_embed_dim = 1
+        pos_embed_dim = pos_embed_dim + 2 if self.use_base else pos_embed_dim
+
+        self.robot_state_pos = nn.Embedding(pos_embed_dim, self.hidden_dim)
+
+        self.encoder_action_proj = nn.Linear(self.action_dim, self.hidden_dim)  # project action to embedding
+        self.encoder_left_states_proj = nn.Linear(self.states_dim, self.hidden_dim)  # project qpos to embedding
+        self.encoder_right_states_proj = nn.Linear(self.states_dim, self.hidden_dim)  # project qpos to embedding
+        self.encoder_robot_base_proj = nn.Linear(3, self.hidden_dim)  # project qpos to embedding
+        self.encoder_robot_head_proj = nn.Linear(3, self.hidden_dim)  # project qpos to embedding
         
-        if kl_weight != 0:
-            self.encoder_action_proj = nn.Linear(action_dim, hidden_dim)  # project action to embedding
-            self.encoder_joint_proj = nn.Linear(state_dim, hidden_dim)  # project qpos to embedding
+        self.latent_proj = nn.Linear(self.hidden_dim, self.latent_dim * 2)  # project hidden state to latent std, var
 
-            self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)  # project hidden state to latent std, var
-            self.register_buffer('pos_table',
-                                 get_sinusoid_encoding_table(1 + 1 + num_queries, hidden_dim))  # [CLS], qpos, a_seq
+        self.encoder_addition_block_dim = 2 # cls + joints
+        self.encoder_addition_block_dim = self.encoder_addition_block_dim + 2 if self.use_base else self.encoder_addition_block_dim
 
-    def forward(self, image, depth_image, robot_state, actions=None, action_is_pad=None):
-        """
-        qpos: batch, qpos_dim
-        image: batch, num_cam, channel, height, width
-        env_state: None                                   没有值
-        actions: batch, seq, action_dim                    
-        """
+        self.register_buffer('pos_table', get_sinusoid_encoding_table(self.encoder_addition_block_dim + self.chunk_size, self.hidden_dim)) # cls
 
-        # print("forward: ", qpos.shape, image.shape, env_state, actions.shape, action_is_pad.shape)
-
+    def encode_process(self, left_states, right_states, robot_base=None, robot_head=None, actions=None, action_is_pad=None):
+        
+        bs = left_states.shape[0]
         is_training = actions is not None  # train or val
-        bs, _ = robot_state.shape
+        
+        # 將states拆分成两部分输入
+        # print("\n图像编码器 start1 :", print_gpu_mem())
+            
+        if is_training:  # self.hidden_dim输入参数是512
+            action_embed = self.encoder_action_proj(actions)  # (bs, seq, self.hidden_dim)
+            
+            left_states_embed = self.encoder_left_states_proj(left_states)  # (bs, self.hidden_dim)
+            left_states_embed = torch.unsqueeze(left_states_embed, dim=1)
+            
+            cls_embed = self.cls_embed.weight  # (1, self.hidden_dim)
+            cls_embed = torch.unsqueeze(cls_embed, dim=0).repeat(bs, 1, 1)  # (bs, 1, self.hidden_dim)
+            
+            if self.use_base:
+                robot_base_embed = self.encoder_robot_base_proj(robot_base)  # (bs, self.hidden_dim)
+                robot_base_embed = torch.unsqueeze(robot_base_embed, dim=1)
+                
+                robot_head_embed = self.encoder_robot_head_proj(robot_head)  # (bs, self.hidden_dim)
+                robot_head_embed = torch.unsqueeze(robot_head_embed, dim=1)
 
-        # Obtain latent z from action sequence
-        if is_training and self.kl_weight != 0:  # hidden_dim输入参数是512
-            action_embed = self.encoder_action_proj(actions)  # (bs, seq, hidden_dim)
-            robot_state_embed = self.encoder_joint_proj(robot_state)  # (bs, hidden_dim)
-            robot_state_embed = torch.unsqueeze(robot_state_embed, dim=1)  # (bs, 1, hidden_dim)
-            cls_embed = self.cls_embed.weight  # (1, hidden_dim)
-            cls_embed = torch.unsqueeze(cls_embed, dim=0).repeat(bs, 1, 1)  # (bs, 1, hidden_dim)
-            encoder_input = torch.cat([cls_embed, robot_state_embed,
-                                       action_embed], dim=1)  # (bs, seq+1, hidden_dim)
-            encoder_input = encoder_input.permute(1, 0, 2)  # (seq+1, bs, hidden_dim)
-            cls_joint_is_pad = torch.zeros((bs, 2), dtype=torch.bool)
-            cls_joint_is_pad = cls_joint_is_pad.to(robot_state.device)
+            if self.use_base:
+                encoder_input = torch.cat([cls_embed, left_states_embed, robot_base_embed, robot_head_embed, action_embed], dim=1)  # (bs, seq+1, self.hidden_dim)
+            else:
+                encoder_input = torch.cat([cls_embed, left_states_embed, action_embed], dim=1)  # (bs, seq+1, self.hidden_dim)
+                
+            encoder_input = encoder_input.permute(1, 0, 2)  # (seq+1, bs, self.hidden_dim)
+            cls_joint_is_pad = torch.zeros((bs, self.encoder_addition_block_dim), dtype=torch.bool) # cls+left_states + right_states=(8, 3)
+            cls_joint_is_pad = cls_joint_is_pad.to(left_states.device)
 
             is_pad = torch.cat([cls_joint_is_pad, action_is_pad], dim=1)  # (bs, seq+1)
 
             # obtain position embedding  合并位置编码
             pos_embed = self.pos_table.clone().detach()
-            pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, hidden_dim)
+            pos_embed = pos_embed.permute(1, 0, 2)  # (seq+1, 1, self.hidden_dim)
+
             encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
             encoder_output = encoder_output[0]  # take cls output only
 
-            # 线性层  hidden_dim扩大到64
+            # 线性层  self.hidden_dim扩大到64
             latent_info = self.latent_proj(encoder_output)
             mu = latent_info[:, :self.latent_dim]
             logvar = latent_info[:, self.latent_dim:]
@@ -146,57 +175,89 @@ class DETRVAE(nn.Module):
             latent_input = self.latent_out_proj(latent_sample)
         else:
             mu = logvar = None
-            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(robot_state.device)
+            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(left_states.device)
             latent_input = self.latent_out_proj(latent_sample)
             
+        return latent_input, mu, logvar
+    
+    
+    def forward(self, image, depth_image, left_states, right_states, robot_base=None, robot_head=None,actions=None, action_is_pad=None, command_embedding=None):
+
+        latent_input, mu, logvar = self.encode_process(left_states, right_states, robot_base=robot_base, robot_head=robot_head, actions=actions, action_is_pad=action_is_pad)
+        
+        # print("forward: ", qpos.shape, image.shape, env_state, actions.shape, action_is_pad.shape)
+        if command_embedding is not None:
+            if self.use_language:
+                command_embedding_proj = self.lang_embed_proj(command_embedding)
+            else:
+                raise NotImplementedError
+            
+        is_training = actions is not None  # train or val
+
         # Image observation features and position embeddings
         all_cam_features = []
         all_cam_depth_features = []
         all_cam_pos = []
         for cam_id, cam_name in enumerate(self.camera_names):
             # features, pos = self.backbones[0](image[:, cam_id])  # HARDCODED
-            features, src_pos = self.backbones[cam_id](image[:, cam_id])  # HARDCODED
-            # image_test = image[:, cam_id][:, 0].unsqueeze(dim=1)
-            # print("depth_encoder:", self.depth_encoder(image_test))
+            features, img_src_pos = self.backbones[cam_id](image[:, cam_id])  # HARDCODED
             features = features[0]  # take the last layer feature
-            src_pos = src_pos[0]
+            img_src_pos = img_src_pos[0]
             if self.depth_backbones is not None and depth_image is not None:
                 features_depth = self.depth_backbones[cam_id](depth_image[:, cam_id].unsqueeze(dim=1))
                 all_cam_features.append(self.input_proj(torch.cat([features, features_depth], dim=1)))
             else:
                 all_cam_features.append(self.input_proj(features))
-            all_cam_pos.append(src_pos)
-        # proprioception features
-        robot_state_input = self.input_proj_robot_state(robot_state)
-        robot_state_input = torch.unsqueeze(robot_state_input, dim=0)
-        latent_input = torch.unsqueeze(latent_input, dim=0)
+            all_cam_pos.append(img_src_pos)
+
+        left_states_input = self.input_proj_left_state(left_states)
+        left_states_input = torch.unsqueeze(left_states_input, dim=0)
+
         # fold camera dimension into width dimension
-        src = torch.cat(all_cam_features, dim=3)
-        src_pos = torch.cat(all_cam_pos, dim=3)
+        img_src = torch.cat(all_cam_features, dim=3)
+        img_src_pos = torch.cat(all_cam_pos, dim=3)
+        
+        latent_input = torch.unsqueeze(latent_input, dim=0)
+        
+        if self.use_base:
+            robot_base_input = self.input_proj_robot_base(robot_base)
+            robot_base_input = torch.unsqueeze(robot_base_input, dim=0)
+            
+            robot_head_input = self.input_proj_robot_head(robot_head)
+            robot_head_input = torch.unsqueeze(robot_head_input, dim=0)
+        else:
+            robot_base_input = None
+            robot_head_input = None
+
+        right_states_input = None
+            
         hs = self.transformer(self.query_embed.weight,
-                              src, src_pos, None,
-                              robot_state_input, self.robot_state_pos.weight,
-                              latent_input, self.latent_pos.weight)[0]
+                            img_src, img_src_pos, None,
+                            left_states_input, right_states_input, robot_base_input, robot_head_input, self.robot_state_pos.weight,
+                            latent_input, self.latent_pos.weight)[0]
+
+               
         a_hat = self.action_head(hs)
 
         return a_hat, [mu, logvar]
 
 
 class CNNMLP(nn.Module):
-    def __init__(self, backbones, depth_backbones, state_dim, camera_names):
+    def __init__(self, backbones, depth_backbones, states_dim, camera_names):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
             transformer: torch module of the transformer architecture. See transformer.py
-            state_dim: robot state dimension of the environment
-            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
+            states_dim: robot state dimension of the environment
+            chunk_size: number of object queries, ie detection slot. This is the maximal number of objects
                          DETR can detect in a single image. For COCO, we recommend 100 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
         super().__init__()
         self.camera_names = camera_names
         self.depth_backbones = depth_backbones
-        self.action_head = nn.Linear(1000, state_dim)  # TODO add more
+        # print(f'^^^^^^^^^^^^^^^^^^^^^{states_dim=}')
+        self.action_head = nn.Linear(1000, states_dim)  # TODO add more
 
         if backbones is not None:
             self.backbones = nn.ModuleList(backbones)
@@ -214,8 +275,8 @@ class CNNMLP(nn.Module):
                 backbone_down_projs.append(down_proj)
             self.backbone_down_projs = nn.ModuleList(backbone_down_projs)
 
-            mlp_in_dim = 768 * len(backbones) + state_dim
-            self.mlp = mlp(input_dim=mlp_in_dim, hidden_dim=1024, output_dim=state_dim, hidden_depth=2)
+            mlp_in_dim = 768 * len(backbones) + states_dim
+            self.mlp = mlp(input_dim=mlp_in_dim, hidden_dim=1024, output_dim=states_dim, hidden_depth=2)
         else:
             raise NotImplementedError
 
@@ -244,20 +305,20 @@ class CNNMLP(nn.Module):
         flattened_features = torch.cat(flattened_features, axis=1)  # 768 each
         features = torch.cat([flattened_features, robot_state], axis=1) # qpos: 14
         a_hat = self.mlp(features)
-
+        # print(f')****************a_hat.shape={a_hat.shape=}')
         return a_hat
 
 
 class Diffusion(nn.Module):
-    def __init__(self, backbones, pools, linears, depth_backbones, state_dim, chunk_size,
+    def __init__(self, backbones, pools, linears, depth_backbones, states_dim, chunk_size,
                  observation_horizon, action_horizon, num_inference_timesteps,
                  ema_power, camera_names):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
             transformer: torch module of the transformer architecture. See transformer.py
-            state_dim: robot state dimension of the environment
-            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
+            states_dim: robot state dimension of the environment
+            chunk_size: number of object queries, ie detection slot. This is the maximal number of objects
                          DETR can detect in a single image. For COCO, we recommend 100 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
@@ -275,14 +336,14 @@ class Diffusion(nn.Module):
         self.chunk_size = chunk_size
         self.num_inference_timesteps = num_inference_timesteps
         self.ema_power = ema_power
-        self.state_dim = state_dim
+        self.states_dim = states_dim
         self.weight_decay = 0
         self.num_kp = 32
         self.feature_dimension = 64
-        self.ac_dim = state_dim
-        self.obs_dim = self.feature_dimension * len(self.camera_names) + state_dim  # camera features and proprio
+        self.ac_dim = states_dim
+        self.obs_dim = self.feature_dimension * len(self.camera_names) + states_dim  # camera features and proprio
         self.noise_pred_net = ConditionalUnet1D(
-            input_dim=self.state_dim,
+            input_dim=self.states_dim,
             global_cond_dim=self.obs_dim * self.observation_horizon
         )
         if depth_backbones is not None:
@@ -306,7 +367,7 @@ class Diffusion(nn.Module):
             })
 
         nets = nets.float().cuda()
-        ENABLE_EMA = True
+        ENABLE_EMA = False # True
         if ENABLE_EMA:
             ema = EMAModel(model=nets, power=self.ema_power)
         else:
@@ -380,7 +441,7 @@ class Diffusion(nn.Module):
 
             # initialize action from Guassian noise
             noisy_action = torch.randn(
-                (B, Tp, self.state_dim), device=obs_cond.device)
+                (B, Tp, self.states_dim), device=obs_cond.device)
             naction = noisy_action
             # init scheduler
             self.noise_scheduler.set_timesteps(self.num_inference_timesteps)
@@ -417,14 +478,6 @@ class Diffusion(nn.Module):
 
 
 def build_diffusion(args):
-    if args.use_single_arm:
-        state_dim = 7
-    else:
-        state_dim = 14
-        
-    if args.use_chassis:
-        state_dim = state_dim + 2 # TODO hardcode
-
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
@@ -452,7 +505,7 @@ def build_diffusion(args):
         pools,
         linears,
         depth_backbones,
-        state_dim=state_dim,
+        states_dim=args.states_dim,
         chunk_size=args.chunk_size,
         observation_horizon=args.observation_horizon,
         action_horizon=args.action_horizon,
@@ -481,7 +534,7 @@ def mlp(input_dim, hidden_dim, output_dim, hidden_depth):
 def build_encoder(args):
     d_model = args.hidden_dim  # 256
     dropout = args.dropout  # 0.1
-    nhead = args.nheads  # 8
+    nhead = args.nheads  # 15
     dim_feedforward = args.dim_feedforward  # 2048
     num_encoder_layers = args.enc_layers  # 4 # TODO shared with VAE decoder
     normalize_before = args.pre_norm  # False
@@ -497,15 +550,7 @@ def build_encoder(args):
     return encoder
 
 
-def build(args):
-    if args.use_single_arm:
-        state_dim = 7
-    else:
-        state_dim = 14
-        
-    if args.use_chassis:
-        state_dim = state_dim + 2 # TODO hardcode
-    
+def build_vae(args):
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
@@ -514,32 +559,23 @@ def build(args):
     if args.use_depth_image:
         depth_backbones = []
 
-    # backbone = build_backbone(args)  # 位置编码和主干网络组合成特征提取器
-    # backbones.append(backbone)
-    # if args.use_depth_image:
-    #     depth_backbones.append(DepthNet())
-
     for _ in args.camera_names:
         backbone = build_backbone(args)
         backbones.append(backbone)
-        if args.use_depth_image:
-            depth_backbones.append(DepthNet())
+        # if args.use_depth_image:
+        #     depth_backbones.append(DepthNet())
 
     transformer = build_transformer(args)  # 构建trans层
 
-    encoder = None
-    if args.kl_weight != 0:
-        encoder = build_encoder(args)  # 构建编码成和解码层
+    # encoder = None
+    encoder = build_encoder(args)  # 构建编码成和解码层
 
     model = DETRVAE(
         backbones,
         depth_backbones,
         transformer,
         encoder,
-        state_dim=state_dim,
-        num_queries=args.chunk_size,
-        camera_names=args.camera_names,
-        kl_weight=args.kl_weight
+        args,
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -549,13 +585,8 @@ def build(args):
 
 
 def build_cnnmlp(args):
-    if args.use_single_arm:
-        state_dim = 7
-    else:
-        state_dim = 14
-        
-    if args.use_chassis:
-        state_dim = state_dim + 2 # TODO hardcode
+    if args.use_base:
+        args.states_dim = args.states_dim + 5
 
     # From state
     # backbone = None # from state for now, no need for conv nets
@@ -579,7 +610,7 @@ def build_cnnmlp(args):
     model = CNNMLP(
         backbones,
         depth_backbones,
-        state_dim=state_dim,
+        states_dim=args.states_dim,
         camera_names=args.camera_names,
     )
 

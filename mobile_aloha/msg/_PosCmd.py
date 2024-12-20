@@ -34,7 +34,8 @@ float64[6] tempFloatData
 int32[6] tempIntData
 int32 mode1
 int32 mode2
-int32 timeCount"""
+int32 timeCount
+"""
   __slots__ = ['x','y','z','roll','pitch','yaw','gripper','quater_x','quater_y','quater_z','quater_w','chx','chy','chz','vel_l','vel_r','height','head_pit','head_yaw','tempFloatData','tempIntData','mode1','mode2','timeCount']
   _slot_types = ['float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64','float64[6]','int32[6]','int32','int32','int32']
 

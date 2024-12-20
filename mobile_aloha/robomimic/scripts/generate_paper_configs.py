@@ -264,7 +264,7 @@ def modify_config_for_dataset(config, task_name, dataset_type, hdf5_type, base_d
                 config.observation.encoder.rgb.obs_randomizer_kwargs.crop_height = 216
                 config.observation.encoder.rgb.obs_randomizer_kwargs.crop_width = 216
             else:
-                # head and wrist camera
+                # front and wrist camera
                 config.observation.modalities.obs.rgb = [
                     "image",
                     "image_wrist",

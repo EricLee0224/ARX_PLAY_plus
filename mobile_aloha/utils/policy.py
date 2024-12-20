@@ -9,6 +9,71 @@ import IPython
 e = IPython.embed
 
 
+class ACTPolicy(nn.Module):
+    def __init__(self, args_override):
+        super().__init__()
+        model, optimizer = build_ACT_model_and_optimizer(args_override)
+
+        self.model = model  # CVAE decoder
+        self.optimizer = optimizer
+        self.kl_weight = args_override['kl_weight']
+        self.loss_function = args_override['loss_function']
+
+        # print(f'KL Weight {self.kl_weight}')
+
+    def __call__(self, image, depth_image, left_states, right_states, robot_base=None, robot_head=None, actions=None,
+                 action_is_pad=None, command_embedding=None):
+
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])  # 在大型数据集中计算得出的，例如ImageNet
+        depth_normalize = transforms.Normalize(mean=[0.5], std=[0.5])
+
+        image = normalize(image)  # 图像归一化
+
+        if depth_image is not None:
+            depth_image = depth_normalize(depth_image)
+
+        # 总共max个步 只取前model.chunk_size个
+        if actions is not None:  # training time
+            a_hat, (mu, logvar) = self.model(image, depth_image, left_states, right_states, robot_base=robot_base,
+                                             robot_head=robot_head, actions=actions, action_is_pad=action_is_pad)
+
+            loss_dict = dict()
+            if self.loss_function == 'l1':
+                all_l1 = F.l1_loss(actions, a_hat, reduction='none')
+            elif self.loss_function == 'l2':
+                all_l1 = F.mse_loss(actions, a_hat, reduction='none')
+            else:
+                all_l1 = F.smooth_l1_loss(actions, a_hat, reduction='none')  # 没有精确度
+
+            l1 = (all_l1 * ~action_is_pad.unsqueeze(-1)).mean()
+
+            loss_dict['l1'] = l1
+            if self.kl_weight != 0:
+                total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
+                loss_dict['kl'] = total_kld[0]
+                loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight  # * 0.5 #
+            else:
+                loss_dict['loss'] = loss_dict['l1']
+
+            return loss_dict, a_hat
+        else:  # inference time
+            a_hat, image_feature = self.model(image, depth_image, left_states, right_states,
+                                              robot_base=robot_base, robot_head=robot_head,
+                                              command_embedding=None)
+
+            return a_hat, image_feature
+
+    def configure_optimizers(self):
+        return self.optimizer
+
+    def serialize(self):
+        return self.state_dict()
+
+    def deserialize(self, model_dict):
+        return self.load_state_dict(model_dict)
+
+
 class DiffusionPolicy(nn.Module):
     def __init__(self, args_override):
         super().__init__()
@@ -39,71 +104,6 @@ class DiffusionPolicy(nn.Module):
 
     def deserialize(self, model_dict):
         return self.model.deserialize(model_dict)
-
-
-class ACTPolicy(nn.Module):
-    def __init__(self, args_override):
-        super().__init__()
-        model, optimizer = build_ACT_model_and_optimizer(args_override)
-
-        self.model = model  # CVAE decoder
-        self.optimizer = optimizer
-        self.kl_weight = args_override['kl_weight']
-        self.loss_function = args_override['loss_function']
-
-        print(f'KL Weight {self.kl_weight}')
-
-    def __call__(self, image, depth_image, robot_state, actions=None, action_is_pad=None):
-
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        depth_normalize = transforms.Normalize(mean=[0.5], std=[0.5])
-
-        image = normalize(image)  # 图像归一化
-        if depth_image is not None:
-            depth_image = depth_normalize(depth_image)
-
-        # 总共max个步 只取前model.num_queries个 
-        if actions is not None:  # training time
-            actions = actions[:, :self.model.num_queries]
-            action_is_pad = action_is_pad[:, :self.model.num_queries]
-
-            a_hat, (mu, logvar) = self.model(image, depth_image, robot_state,
-                                             actions, action_is_pad)
-
-            loss_dict = dict()
-            if self.loss_function == 'l1':
-                # print(f"{actions.shape=},{a_hat.shape=}")
-                all_l1 = F.l1_loss(actions, a_hat, reduction='none')
-            elif self.loss_function == 'l2':
-                all_l1 = F.mse_loss(actions, a_hat, reduction='none')
-            else:
-                all_l1 = F.smooth_l1_loss(actions, a_hat, reduction='none')
-
-            l1 = (all_l1 * ~action_is_pad.unsqueeze(-1)).mean()
-
-            loss_dict['l1'] = l1
-            if self.kl_weight != 0:
-                total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
-                loss_dict['kl'] = total_kld[0]
-                loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * 0.5 # self.kl_weight
-            else:
-                loss_dict['loss'] = loss_dict['l1']
-
-            return loss_dict, a_hat
-        else:  # inference time
-            a_hat, (_, _) = self.model(image, depth_image, robot_state)  # no action, sample from prior
-            
-            return a_hat
-
-    def configure_optimizers(self):
-        return self.optimizer
-
-    def serialize(self):
-        return self.state_dict()
-
-    def deserialize(self, model_dict):
-        return self.load_state_dict(model_dict)
 
 
 class CNNMLPPolicy(nn.Module):
@@ -142,7 +142,7 @@ class CNNMLPPolicy(nn.Module):
             return loss_dict, a_hat
 
         else:  # inference time
-            a_hat = self.model(image, depth_image, robot_state) # no action, sample from prior
+            a_hat = self.model(image, depth_image, robot_state)  # no action, sample from prior
 
             return a_hat
 

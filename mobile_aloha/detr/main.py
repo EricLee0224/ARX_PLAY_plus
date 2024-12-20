@@ -104,8 +104,7 @@ def build_ACT_model_and_optimizer(args_override):
     ]
 
     # 优化器
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
 
     return model, optimizer
 
