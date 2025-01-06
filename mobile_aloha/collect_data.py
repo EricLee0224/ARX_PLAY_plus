@@ -315,7 +315,7 @@ def save_data(args, timesteps, actions, actions_eef, action_bases, dataset_path)
     t0 = time.time()
     with h5py.File(dataset_path + '.hdf5', 'w', rdcc_nbytes=1024 ** 2 * 2) as root:
         root.attrs['sim'] = False
-        root.attrs['compress'] = True if args.is_compress else True
+        root.attrs['compress'] = True if args.is_compress else False
 
         obs_dict = root.create_group('observations')
         image = obs_dict.create_group('images')
