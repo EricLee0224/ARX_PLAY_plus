@@ -250,16 +250,26 @@ def get_norm_stats(dataset_dir, num_episodes, policy_config):
     for episode_idx in range(num_episodes):
         dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
 
-        with h5py.File(dataset_path, 'r') as root:
-            qpos = root['/observations/qpos'][()]
-            eef = root['/observations/eef'][()]
-            qvel = root['/observations/qvel'][()]
-            effort = root['/observations/effort'][()]
-            robot_base = root['/observations/robot_base'][()]
-            action = root['/action'][()]
+        try:
+            with h5py.File(dataset_path, 'r') as root:
+                try:
+                    qpos = root['/observations/qpos'][()]
+                    eef = root['/observations/eef'][()]
+                    qvel = root['/observations/qvel'][()]
+                    effort = root['/observations/effort'][()]
+                    robot_base = root['/observations/robot_base'][()]
+                    action = root['/action'][()]
+                except KeyError as e:
+                    print(f"Key error in file {dataset_path}: {e}")
+                except ValueError as e:
+                    print(f"Value error while processing file {dataset_path}: {e}")
 
-            if policy_config['use_base']:
-                action = np.concatenate((action, root['/action_base'][()]), axis=1)
+                if use_base:
+                    action = np.concatenate((action, root['/action_base'][()]), axis=1)
+        except FileNotFoundError:
+            print(f"File not found: {dataset_path}")
+        except OSError as e:
+            print(f"OS error when accessing file {dataset_path}: {e}")
 
         left_states, right_states, action = get_IO_for_norm(qpos, eef, qvel, effort, action, policy_config)
 
