@@ -264,7 +264,7 @@ def get_norm_stats(dataset_dir, num_episodes, policy_config):
                 except ValueError as e:
                     print(f"Value error while processing file {dataset_path}: {e}")
 
-                if use_base:
+                if policy_config['use_base']:
                     action = np.concatenate((action, root['/action_base'][()]), axis=1)
         except FileNotFoundError:
             print(f"File not found: {dataset_path}")
