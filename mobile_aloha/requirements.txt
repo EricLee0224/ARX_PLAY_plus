@@ -17,3 +17,4 @@ diffusers
 termcolor
 imageio
 onnx
+pyttsx3
