@@ -26,10 +26,17 @@ check_path "${workspace}/ARX_PLAY/mobile_aloha"
 
 check_executable "${workspace}/ARX_PLAY/realsense_camera/realsense.sh"
 
-if [ -d "${workspace}/LIFT" ]; then
-    check_executable "${workspace}/LIFT/00-sh/ROS/remote_LIFT.sh"
+if [ -d "${workspace}/LIFT" ] || [ -d "${workspace}/LIFT_ALL_IN_ONE" ]; then
+    target_dir=""
+    if [ -d "${workspace}/LIFT" ]; then
+        target_dir="${workspace}/LIFT"
+    else
+        target_dir="${workspace}/LIFT_ALL_IN_ONE"
+    fi
 
-    gnome-terminal --title="lift" -- bash -c "cd ${workspace}/LIFT/00-sh/ROS/; bash remote_LIFT.sh; exec bash"
+    check_executable "${target_dir}/00-sh/ROS/remote_LIFT.sh"
+
+    gnome-terminal --title="lift" -- bash -c "cd ${target_dir}/00-sh/ROS/; bash remote_LIFT.sh; exec bash"
     sleep 1
 elif [ -d "${workspace}/R5" ]; then
     gnome-terminal --title="master" -- bash -c "cd ${workspace}/ARX_X5/ROS/X5_ws/; source ./devel/setup.bash && roslaunch arx_x5_controller open_remote_master.launch; exec bash"

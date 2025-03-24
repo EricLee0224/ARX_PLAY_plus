@@ -26,18 +26,25 @@ check_path "${workspace}/ARX_PLAY/mobile_aloha"
 
 check_executable "${workspace}/ARX_PLAY/realsense_camera/realsense.sh"
 
-if [ -d "${workspace}/LIFT" ]; then
-    check_path "${workspace}/LIFT/ARX_CAN/arx_can"
-    check_path "${workspace}/LIFT/body/ROS"
-    check_path "${workspace}/LIFT/LIFT_ARM/ROS/R5Pro_ws"
+if [ -d "${workspace}/LIFT" ] || [ -d "${workspace}/LIFT_ALL_IN_ONE" ]; then
+    target_dir=""
+    if [ -d "${workspace}/LIFT" ]; then
+        target_dir="${workspace}/LIFT"
+    else
+        target_dir="${workspace}/LIFT_ALL_IN_ONE"
+    fi
 
-    check_executable "${workspace}/LIFT/ARX_CAN/arx_can/arx_can1.sh"
-    check_executable "${workspace}/LIFT/ARX_CAN/arx_can/arx_can3.sh"
-    check_executable "${workspace}/LIFT/ARX_CAN/arx_can/arx_can5.sh"
+    check_path "${target_dir}/ARX_CAN/arx_can"
+    check_path "${target_dir}/body/ROS"
+    check_path "${target_dir}/LIFT_ARM/ROS/R5Pro_ws"
 
-    gnome-terminal --title="lift" -- bash -c "cd ${workspace}/LIFT/body/ROS/; source ./devel/setup.bash && roslaunch arx_lift_controller lift.launch; exec bash"
+    check_executable "${target_dir}/ARX_CAN/arx_can/arx_can1.sh"
+    check_executable "${target_dir}/ARX_CAN/arx_can/arx_can3.sh"
+    check_executable "${target_dir}/ARX_CAN/arx_can/arx_can5.sh"
+
+    gnome-terminal --title="lift" -- bash -c "cd ${target_dir}/body/ROS/; source ./devel/setup.bash && roslaunch arx_lift_controller lift.launch; exec bash"
     sleep 1
-    gnome-terminal --title="r5pro" -- bash -c "cd ${workspace}/LIFT/LIFT_ARM/ROS/R5Pro_ws/; source ./devel/setup.bash && roslaunch arx_r5pro_controller open_double_arm.launch; exec bash"
+    gnome-terminal --title="r5pro" -- bash -c "cd ${target_dir}/LIFT_ARM/ROS/R5Pro_ws/; source ./devel/setup.bash && roslaunch arx_r5pro_controller open_double_arm.launch; exec bash"
     sleep 1
 elif [ -d "${workspace}/R5" ]; then
     check_executable "${workspace}/R5/ARX_CAN/arx_can/arx_can1.sh"

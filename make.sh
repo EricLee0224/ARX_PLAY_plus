@@ -15,8 +15,15 @@ check_path() {
 check_path "${workspace}/ARX_PLAY/realsense_camera"
 check_path "${workspace}/ARX_PLAY/mobile_aloha"
 
-if [ -d "${workspace}/LIFT" ]; then
-    gnome-terminal --title="lift" -- bash -c "cd ${workspace}/LIFT/00-sh/ROS/; bash 01make.sh; bash 02make.sh; exec bash"
+if [ -d "${workspace}/LIFT" ] || [ -d "${workspace}/LIFT_ALL_IN_ONE" ]; then
+    target_dir=""
+    if [ -d "${workspace}/LIFT" ]; then
+        target_dir="${workspace}/LIFT"
+    else
+        target_dir="${workspace}/LIFT_ALL_IN_ONE"
+    fi
+
+    gnome-terminal --title="lift" -- bash -c "cd ${target_dir}/00-sh/ROS/; bash 01make.sh; bash 02make.sh; exec bash"
     sleep 1
 elif [ -d "${workspace}/R5" ]; then
     gnome-terminal --title="r5" -- bash -c "cd ${workspace}/R5/00-sh/ROS/; bash 01make.sh; bash 02make.sh; exec bash"
