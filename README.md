@@ -1,7 +1,7 @@
 ### Declaration
 ARX_PLAY_plus's new feature:
 - [Data post-process] Zero-frame trimmer
-- [know why] ACT decoderlayer attention weights visualization on obs_cam
+- [Know why] ACT decoderlayer attention weights visualization on obs_cam
 
 ---
 
