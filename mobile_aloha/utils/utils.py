@@ -14,6 +14,16 @@ from scipy.spatial.transform import Rotation as R  # eef:ZXY
 FILTER_MISTAKES = False  # Filter out mistakes from the dataset even if not use_language
 
 
+def _h5_attr_truthy(root, key: str, default: bool = False) -> bool:
+    """Read optional HDF5 root attribute as bool (Flexiv converter sets action_is_next_step)."""
+    if key not in root.attrs:
+        return default
+    v = root.attrs[key]
+    if isinstance(v, np.ndarray):
+        v = v.item()
+    return bool(v)
+
+
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(self, episode_ids, dataset_dir, policy_config, norm_stats, arm_delay_time):
         super(EpisodicDataset).__init__()
@@ -47,6 +57,18 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
             self.add_action_output = False
 
+        # 单臂在 qpos 中维数：7→14 总长，8→16（Flexiv 7关节+夹爪）
+        self.joints_per_arm = int(policy_config.get("joints_per_arm", 7))
+
+        self.gripper_binary = bool(policy_config.get("gripper_binary", False))
+        if self.gripper_binary:
+            gmin = norm_stats.get("gripper_raw_min", np.array([0.0, 0.0]))
+            gmax = norm_stats.get("gripper_raw_max", np.array([1.0, 1.0]))
+            self._gripper_lmin = float(gmin[0])
+            self._gripper_lmax = float(gmax[0])
+            self._gripper_rmin = float(gmin[1])
+            self._gripper_rmax = float(gmax[1])
+
         self.__getitem__(0)  # initialize self.is_sim
 
     def __len__(self):
@@ -72,11 +94,20 @@ class EpisodicDataset(torch.utils.data.Dataset):
             max_action_len = original_action_shape[0]  # max_episode
             start_ts = np.random.choice(max_action_len)  # 随机抽取一个索引
 
-            states2action_step = 1
-            actions = actions[states2action_step:]  # 错开了一帧 # ,
-            last_action = actions[-1]
-            last_action = np.tile(last_action[np.newaxis, :], (states2action_step, 1))
-            actions = np.append(actions, last_action, axis=0)  # actions[-1][np.newaxis, :]
+            # If action already stores next-timestep targets (e.g. Flexiv converter), skip shift to avoid double offset.
+            if not _h5_attr_truthy(root, "action_is_next_step", False):
+                states2action_step = 1
+                actions = actions[states2action_step:]  # 错开了一帧 # ,
+                last_action = actions[-1]
+                last_action = np.tile(last_action[np.newaxis, :], (states2action_step, 1))
+                actions = np.append(actions, last_action, axis=0)  # actions[-1][np.newaxis, :]
+
+            if self.gripper_binary:
+                actions = np.array(actions, dtype=np.float32)
+                remap_gripper_01(actions, self.joints_per_arm,
+                                 self._gripper_lmin, self._gripper_lmax,
+                                 self._gripper_rmin, self._gripper_rmax)
+                binarize_gripper_01(actions, self.joints_per_arm)
 
             if self.add_action_output:
                 action_zero_addition = np.zeros(original_action_shape)
@@ -85,6 +116,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
             additional_action_shape = actions.shape
 
             qpos = root['/observations/qpos'][start_ts]
+            if self.gripper_binary:
+                qpos = np.array(qpos, dtype=np.float32)
+                remap_gripper_01(qpos, self.joints_per_arm,
+                                 self._gripper_lmin, self._gripper_lmax,
+                                 self._gripper_rmin, self._gripper_rmax)
+                binarize_gripper_01(qpos, self.joints_per_arm)
             eef = root['/observations/eef'][start_ts]
             qvel = root['/observations/qvel'][start_ts]
             effort = root['/observations/effort'][start_ts]
@@ -93,7 +130,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
             states_init = root['/observations/eef'][0]
 
-            joints_dim = 7
+            joints_dim = self.joints_per_arm
 
             left_states_init = states_init[:joints_dim]
             left_qpos = qpos[:joints_dim]
@@ -209,7 +246,20 @@ def get_IO_for_norm(qpos, eef, qvel, effort, action, policy_config):
         use_effort = False
         add_action_output = False
 
-    joints_dim = 7
+    joints_dim = int(policy_config.get("joints_per_arm", 7))
+
+    if policy_config.get("gripper_binary"):
+        mm = policy_config.get("_gripper_raw_minmax")
+        if mm:
+            lmin, lmax, rmin, rmax = mm
+        else:
+            lmin, lmax, rmin, rmax = 0.0, 1.0, 0.0, 1.0
+        qpos = np.array(qpos, dtype=np.float32, copy=True)
+        action = np.array(action, dtype=np.float32, copy=True)
+        remap_gripper_01(qpos, joints_dim, lmin, lmax, rmin, rmax)
+        binarize_gripper_01(qpos, joints_dim)
+        remap_gripper_01(action, joints_dim, lmin, lmax, rmin, rmax)
+        binarize_gripper_01(action, joints_dim)
 
     # left or single
     left_qpos = qpos[:, :joints_dim]
@@ -240,7 +290,145 @@ def get_IO_for_norm(qpos, eef, qvel, effort, action, policy_config):
     return left_states, right_states, action
 
 
+def state_vector_gripper_indices(policy_config) -> tuple[int, int]:
+    """在 EpisodicDataset 里 ``left_states = concat(左臂块, 右臂块)`` 中，qpos 夹爪分量下标。"""
+    j = int(policy_config.get("joints_per_arm", 8))
+    use_qvel = bool(policy_config.get("use_qvel", False))
+    use_effort = bool(policy_config.get("use_effort", False))
+    arm_seg = j + (j if use_qvel else 0) + (1 if use_effort else 0)
+    left_g = j - 1
+    right_g = arm_seg + j - 1
+    return left_g, right_g
+
+
+def scan_gripper_min_max(dataset_dir: str, num_episodes: int, joints_per_arm: int,
+                         percentile_lo: float = 1.0, percentile_hi: float = 99.0):
+    """遍历所有 episode，统计 qpos 与 action 中左右夹爪维的 min/max。
+
+    使用百分位数（默认 1% / 99%）代替绝对 min/max，避免个别极端值
+    （如某条 episode 夹爪意外到 0）拉偏 remap 范围和二值化阈值。
+    """
+    j = int(joints_per_arm)
+    left_parts: list[np.ndarray] = []
+    right_parts: list[np.ndarray] = []
+    for episode_idx in range(num_episodes):
+        dataset_path = os.path.join(dataset_dir, f"episode_{episode_idx}.hdf5")
+        if not os.path.isfile(dataset_path):
+            continue
+        with h5py.File(dataset_path, "r") as root:
+            qpos = root["/observations/qpos"][()]
+            action = root["/action"][()]
+        for arr, label in [(qpos, "qpos"), (action, "action")]:
+            if arr.shape[1] < 2 * j:
+                raise ValueError(
+                    f"{dataset_path}: {label} width {arr.shape[1]} < {2 * j} (expected flexiv_16 layout)"
+                )
+            left_parts.append(arr[:, j - 1].astype(np.float64))
+            right_parts.append(arr[:, 2 * j - 1].astype(np.float64))
+    if not left_parts:
+        return None
+    lv = np.concatenate(left_parts)
+    rv = np.concatenate(right_parts)
+    return (
+        float(np.percentile(lv, percentile_lo)),
+        float(np.percentile(lv, percentile_hi)),
+        float(np.percentile(rv, percentile_lo)),
+        float(np.percentile(rv, percentile_hi)),
+    )
+
+
+def _action_gripper_indices(policy_config: dict) -> list[int]:
+    """action 向量（经 get_IO_for_norm 拼接后）中夹爪所在下标列表。
+
+    原始 action: [left_j, right_j] = 2*j 维
+    ACT doubled: [left_j, right_j, zeros(2*j)] = 4*j 维
+    夹爪在 j-1 和 2j-1（doubled 后半全 0，不需要 patch）。
+    """
+    j = int(policy_config.get("joints_per_arm", 8))
+    return [j - 1, 2 * j - 1]
+
+
+def remap_gripper_01(
+    arr: np.ndarray, joints_per_arm: int,
+    lmin: float, lmax: float, rmin: float, rmax: float,
+) -> np.ndarray:
+    """将夹爪列从 [actual_min, actual_max] 线性重映射到 [0, 1]。就地修改并返回。"""
+    j = int(joints_per_arm)
+    lr = max(lmax - lmin, 1e-8)
+    rr = max(rmax - rmin, 1e-8)
+    arr[..., j - 1] = np.clip((arr[..., j - 1] - lmin) / lr, 0.0, 1.0).astype(arr.dtype)
+    arr[..., 2 * j - 1] = np.clip((arr[..., 2 * j - 1] - rmin) / rr, 0.0, 1.0).astype(arr.dtype)
+    return arr
+
+
+def binarize_gripper_01(arr: np.ndarray, joints_per_arm: int, threshold: float = 0.5) -> np.ndarray:
+    """将已在 [0,1] 范围内的夹爪列二值化：> threshold → 1.0 (闭合), <= threshold → 0.0 (张开)。"""
+    j = int(joints_per_arm)
+    arr[..., j - 1] = (arr[..., j - 1] > threshold).astype(arr.dtype)
+    arr[..., 2 * j - 1] = (arr[..., 2 * j - 1] > threshold).astype(arr.dtype)
+    return arr
+
+
+def apply_gripper_minmax_norm_to_stats(stats: dict, policy_config: dict, dataset_dir: str, num_episodes: int) -> dict:
+    """用全数据夹爪实际 min/max 覆盖 state 和 action 的 mean/std，使 (x-mean)/std 在 [min,max] 上约映射到 [-1,1]。"""
+    j = int(policy_config.get("joints_per_arm", 8))
+    mm = scan_gripper_min_max(dataset_dir, num_episodes, j)
+    if mm is None:
+        print("Warning: no episodes found for gripper min-max scan; keeping default stats.")
+        return stats
+    lmin, lmax, rmin, rmax = mm
+
+    def _patch_one_dim(mean_arr, std_arr, idx: int, vmin: float, vmax: float):
+        mean_arr = np.asarray(mean_arr, dtype=np.float64).copy()
+        std_arr = np.asarray(std_arr, dtype=np.float64).copy()
+        if vmax > vmin:
+            mean_arr[idx] = (vmax + vmin) / 2.0
+            std_arr[idx] = max((vmax - vmin) / 2.0, 1e-6)
+        else:
+            mean_arr[idx] = vmin
+            std_arr[idx] = 1e-2
+        return mean_arr, std_arr
+
+    # --- patch state stats ---
+    li, ri = state_vector_gripper_indices(policy_config)
+    for mean_key, std_key in (
+        ("left_states_mean", "left_states_std"),
+        ("right_states_mean", "right_states_std"),
+    ):
+        m, s = stats[mean_key], stats[std_key]
+        m, s = _patch_one_dim(m, s, li, lmin, lmax)
+        m, s = _patch_one_dim(m, s, ri, rmin, rmax)
+        stats[mean_key] = m.astype(np.float32)
+        stats[std_key] = s.astype(np.float32)
+
+    # --- patch action stats ---
+    act_idxs = _action_gripper_indices(policy_config)  # [j-1, 2j-1]
+    act_gripper_vals = [(act_idxs[0], lmin, lmax), (act_idxs[1], rmin, rmax)]
+    m, s = stats["action_mean"], stats["action_std"]
+    for idx, vmin, vmax in act_gripper_vals:
+        m, s = _patch_one_dim(m, s, idx, vmin, vmax)
+    stats["action_mean"] = m.astype(np.float32)
+    stats["action_std"] = s.astype(np.float32)
+
+    stats["gripper_qpos_min"] = np.array([lmin, rmin], dtype=np.float32)
+    stats["gripper_qpos_max"] = np.array([lmax, rmax], dtype=np.float32)
+    stats["gripper_minmax_norm"] = True
+    return stats
+
+
 def get_norm_stats(dataset_dir, num_episodes, policy_config):
+    gripper_binary = policy_config.get("gripper_binary", False)
+    if gripper_binary:
+        j = int(policy_config.get("joints_per_arm", 8))
+        mm = scan_gripper_min_max(dataset_dir, num_episodes, j)
+        if mm:
+            lmin, lmax, rmin, rmax = mm
+        else:
+            lmin, lmax, rmin, rmax = 0.0, 1.0, 0.0, 1.0
+        policy_config["_gripper_raw_minmax"] = (lmin, lmax, rmin, rmax)
+        print(f"Gripper remap: left [{lmin:.4f}, {lmax:.4f}] → [0,1], "
+              f"right [{rmin:.4f}, {rmax:.4f}] → [0,1], then binarize at 0.5")
+
     all_left_states_data = []
     all_right_states_data = []
     all_action_data = []
@@ -345,6 +533,36 @@ def get_norm_stats(dataset_dir, num_episodes, policy_config):
              "robot_head_std": robot_head_std.numpy().squeeze(),
              "robot_head_mean": robot_head_mean.numpy().squeeze(),
              }
+
+    if gripper_binary:
+        li, ri = state_vector_gripper_indices(policy_config)
+        for mean_key, std_key in (
+            ("left_states_mean", "left_states_std"),
+            ("right_states_mean", "right_states_std"),
+        ):
+            stats[mean_key][li] = 0.5
+            stats[std_key][li] = 0.5
+            stats[mean_key][ri] = 0.5
+            stats[std_key][ri] = 0.5
+        for idx in _action_gripper_indices(policy_config):
+            stats["action_mean"][idx] = 0.5
+            stats["action_std"][idx] = 0.5
+        stats["gripper_binary"] = True
+        stats["gripper_raw_min"] = np.array([lmin, rmin], dtype=np.float32)
+        stats["gripper_raw_max"] = np.array([lmax, rmax], dtype=np.float32)
+        print(
+            f"Gripper binary norm: remap→[0,1]→binarize→[-1,+1], "
+            f"left raw [{lmin:.4f},{lmax:.4f}], right raw [{rmin:.4f},{rmax:.4f}]"
+        )
+    elif policy_config.get("gripper_minmax_norm") and policy_config.get("policy_class") == "ACT":
+        stats = apply_gripper_minmax_norm_to_stats(stats, policy_config, dataset_dir, num_episodes)
+        if stats.get("gripper_minmax_norm"):
+            jp = int(policy_config.get("joints_per_arm", 8))
+            print(
+                f"Gripper state norm: min-max over {num_episodes} episodes "
+                f"(left qpos[{jp - 1}] in [{stats['gripper_qpos_min'][0]:.4f}, {stats['gripper_qpos_max'][0]:.4f}], "
+                f"right qpos[{2 * jp - 1}] in [{stats['gripper_qpos_min'][1]:.4f}, {stats['gripper_qpos_max'][1]:.4f}])"
+            )
 
     return stats
 

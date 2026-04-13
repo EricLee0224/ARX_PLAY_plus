@@ -2,9 +2,9 @@
 
 workspace=$(dirname "$(pwd)")
 
-datasets=datasets
+datasets=datasets/pick_cube_150
 ckpt_dir=weights
-num_episodes=50
+num_episodes=150
 batch_size=32
 epochs=3000
 

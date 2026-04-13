@@ -34,6 +34,14 @@ obs_dict = collections.OrderedDict()
 
 np.set_printoptions(linewidth=200)
 
+# 与 train.py 一致：每臂 7 关节 + 1 夹爪 → qpos/action 与 HDF5 flexiv_16 对齐
+FLEXIV_JOINTS_PER_ARM = 8
+
+
+def _arm_segment_last_indices(joints_per_arm: int):
+    """每臂 joints_per_arm 维、左右拼接时，左/右臂最后一个分量的下标（用于切片）。"""
+    return [joints_per_arm - 1, 2 * joints_per_arm - 1]
+
 
 def load_yaml(yaml_file):
     try:
@@ -74,6 +82,7 @@ def get_model_config(args):
     }
 
     if args.policy_class == 'ACT':
+        per_arm = FLEXIV_JOINTS_PER_ARM
         policy_config = {
             **base_config,
             'enc_layers': args.enc_layers,
@@ -81,14 +90,16 @@ def get_model_config(args):
             'nheads': args.nheads,
             'dropout': args.dropout,
             'pre_norm': args.pre_norm,
-            'states_dim': 7,
-            'action_dim': 7,
+            'states_dim': per_arm,
+            'action_dim': per_arm,
+            'joints_per_arm': per_arm,
             'kl_weight': args.kl_weight,
             'dim_feedforward': args.dim_feedforward,
 
             'use_qvel': args.use_qvel,
             'use_effort': args.use_effort,
             'use_eef_states': args.use_eef_states,
+            'use_eef_action': args.use_eef_action,
 
             'command_list': [],
         }
@@ -184,7 +195,8 @@ def robot_action(ros_operator, args, action):
     gripper_gate = args.gripper_gate
     max_gripper = 5
 
-    gripper_idx = [6, 13]
+    j = getattr(args, 'joints_per_arm', FLEXIV_JOINTS_PER_ARM)
+    gripper_idx = _arm_segment_last_indices(j)
 
     left_action = action[:gripper_idx[0] + 1]  # 取8维度
     if gripper_gate != -1:
@@ -251,7 +263,8 @@ def model_inference(args, config, ros_operator, policy):
             while timestep < args.max_publish_step and not rospy.is_shutdown():
                 obs_dict = get_obervations(args, timestep, ros_operator)
 
-                gripper_idx = [6, 13]
+                j = config['policy_config'].get('joints_per_arm', FLEXIV_JOINTS_PER_ARM)
+                gripper_idx = _arm_segment_last_indices(j)
 
                 left_qpos = obs_dict['gpos'][:gripper_idx[0] + 1] if use_eef_states \
                     else obs_dict['qpos'][:gripper_idx[0] + 1]
@@ -439,6 +452,7 @@ def parse_args(known=False):
     parser.add_argument('--use_qvel', action='store_true', help='include qvel in state information')
     parser.add_argument('--use_effort', action='store_true', help='include effort data in state')
     parser.add_argument('--use_eef_states', action='store_true', help='use eef data in state')
+    parser.add_argument('--use_eef_action', action='store_true', help='use eef data for actions (must match training)')
 
     parser.add_argument('--gripper_gate', type=float, default=-1, help='gripper gate threshold')
 
@@ -448,6 +462,7 @@ def parse_args(known=False):
 def main(args):
     data = load_yaml(args.data)
     config = get_model_config(args)
+    args.joints_per_arm = int(config['policy_config'].get('joints_per_arm', FLEXIV_JOINTS_PER_ARM))
     ros_operator = RosOperator(args, data, in_collect=False)
 
     if args.use_base:

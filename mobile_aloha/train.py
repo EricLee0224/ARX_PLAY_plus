@@ -18,6 +18,7 @@ import torch
 import numpy as np
 import pickle
 import argparse
+import h5py
 import matplotlib
 import matplotlib.pyplot as plt
 from copy import deepcopy
@@ -29,6 +30,9 @@ from utils.policy import ACTPolicy, CNNMLPPolicy, DiffusionPolicy
 np.set_printoptions(linewidth=200)
 
 matplotlib.use('Agg')
+
+# Flexiv 本体：每臂 7 关节 + 1 夹爪 → qpos/action 总长 16（与 convert flexiv_16 一致）
+FLEXIV_JOINTS_PER_ARM = 8
 
 
 # 初始化策略配置
@@ -52,9 +56,13 @@ def initialize_policy_config(args, commands):
         'use_base': args.use_base,
 
         'use_depth_image': args.use_depth_image,
+
+        'gripper_minmax_norm': args.gripper_minmax_norm,
+        'gripper_binary': args.gripper_binary,
     }
 
     if args.policy_class == 'ACT':
+        per_arm = FLEXIV_JOINTS_PER_ARM
         act_config = {
             'policy_class': 'ACT',
             'enc_layers': args.enc_layers,
@@ -62,8 +70,9 @@ def initialize_policy_config(args, commands):
             'nheads': args.nheads,
             'dropout': args.dropout,
             'pre_norm': args.pre_norm,
-            'states_dim': 7,
-            'action_dim': 7,
+            'states_dim': per_arm,
+            'action_dim': per_arm,
+            'joints_per_arm': per_arm,
             'kl_weight': args.kl_weight,
             'dim_feedforward': args.dim_feedforward,
 
@@ -75,7 +84,7 @@ def initialize_policy_config(args, commands):
             'command_list': commands,
         }
 
-        # 更新 states_dim
+        # 更新 states_dim（与每条臂的关节/速度维数一致）
         act_config['states_dim'] += act_config['action_dim'] if args.use_qvel else 0
         act_config['states_dim'] += 1 if args.use_effort else 0
         act_config['states_dim'] *= 2
@@ -113,6 +122,42 @@ def initialize_policy_config(args, commands):
         raise NotImplementedError("Unknown policy class")
 
 
+def _validate_first_episode_flexiv(args, dataset_dir: Path) -> None:
+    """Require Flexiv 16-D layout (joints_per_arm=8); check cameras vs --camera_names."""
+    sample = dataset_dir / "episode_0.hdf5"
+    if not sample.is_file():
+        candidates = sorted(dataset_dir.glob("episode_*.hdf5"))
+        if not candidates:
+            raise FileNotFoundError(f"No episode_*.hdf5 under {dataset_dir}")
+        sample = candidates[0]
+        print(f"Note: episode_0.hdf5 not found; using {sample.name} for dataset checks")
+
+    expected_w = 2 * FLEXIV_JOINTS_PER_ARM
+    with h5py.File(sample, "r") as root:
+        if "joints_per_arm" in root.attrs:
+            j = int(np.asarray(root.attrs["joints_per_arm"]).item())
+            if j != FLEXIV_JOINTS_PER_ARM:
+                raise ValueError(
+                    f"{sample}: joints_per_arm={j}, expected {FLEXIV_JOINTS_PER_ARM} "
+                    "(use convert --proprio_layout flexiv_16)"
+                )
+
+        qpos = root["/observations/qpos"]
+        if qpos.shape[1] != expected_w:
+            raise ValueError(
+                f"{sample}: observations/qpos width {qpos.shape[1]}, expected {expected_w} "
+                "(Flexiv 7+1+7+1; re-convert with flexiv_16)"
+            )
+
+        imgs = root["/observations/images"]
+        missing = [c for c in args.camera_names if c not in imgs]
+        if missing:
+            raise KeyError(
+                f"{sample}: missing observations/images keys {missing!r}; "
+                f"available: {list(imgs.keys())}"
+            )
+
+
 def train(args):
     set_seed(args.seed)
 
@@ -125,6 +170,8 @@ def train(args):
     ckpt_dir = task_config['ckpt_dir']
     commands = args.command.split(",") if args.command else []
     print(f'{args.camera_names=}')
+
+    _validate_first_episode_flexiv(args, Path(dataset_dir))
 
     # 初始化策略配置
     policy_config = initialize_policy_config(args, commands)
@@ -410,9 +457,13 @@ def parse_args(known=False):
     parser = argparse.ArgumentParser()
 
     # 数据集和检查点设置
-    parser.add_argument('--datasets', type=str, default=Path.joinpath(ROOT, 'datasets'),
-                        help='dataset dir')
-    parser.add_argument('--ckpt_dir', type=str, default=Path.joinpath(ROOT, 'weights'),
+    parser.add_argument(
+        '--datasets',
+        type=str,
+        default=str(Path.joinpath(ROOT, 'dataset', 'place_tube_150')),
+        help='Directory of flat episode_0.hdf5, episode_1.hdf5, …',
+    )
+    parser.add_argument('--ckpt_dir', type=str, default=Path.joinpath(ROOT, 'weights/0410'),
                         help='ckpt dir')
     parser.add_argument('--ckpt_name', type=str, default='policy_best.ckpt',
                         help='ckpt name')
@@ -424,12 +475,17 @@ def parse_args(known=False):
                         help='Reload datasets; 0 for no reshuffle, otherwise interval value')
 
     # 训练设置
-    parser.add_argument('--num_episodes', type=int, default='50', help='episodes number')
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size')
+    parser.add_argument('--num_episodes', type=int, default=150, help='Number of episode_N.hdf5 files (0 … N-1)')
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=8,
+        help='batch size（相机路数越多 ACT 显存越大；显存够再加大）',
+    )
     parser.add_argument('--seed', type=int, default=0, help='random seed')
-    parser.add_argument('--epochs', type=int, default=3000, help='number of training epochs')
-    parser.add_argument('--lr', type=float, default=4e-5, help='learning rate')
-    parser.add_argument('--lr_backbone', type=float, default=4e-5, help='learning rate for backbone')
+    parser.add_argument('--epochs', type=int, default=8000, help='number of training epochs')
+    parser.add_argument('--lr', type=float, default=1e-5, help='learning rate')
+    parser.add_argument('--lr_backbone', type=float, default=1e-5, help='learning rate for backbone')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay rate')
     parser.add_argument('--loss_function', type=str, choices=['l1', 'l2', 'l1+l2'],
                         default='l1', help='loss function')
@@ -442,10 +498,17 @@ def parse_args(known=False):
     parser.add_argument('--hidden_dim', type=int, default=512, help='hidden layer dimension size')
 
     # 摄像头和位置嵌入设置
-    parser.add_argument('--camera_names', nargs='+', type=str,
-                        choices=['head', 'left_wrist', 'right_wrist'],
-                        default=['head', 'left_wrist', 'right_wrist'],
-                        help='camera names to use')
+    parser.add_argument(
+        '--camera_names',
+        nargs='+',
+        type=str,
+        default=[
+            'left_rightcam',
+            'right_leftcam',
+            'top_cam',
+        ],
+        help='Keys under observations/images/ (must exist in HDF5; default: 双臂各一路腕部 + top RealSense)',
+    )
     parser.add_argument('--position_embedding', type=str, choices=('sine', 'learned'), default='sine',
                         help='type of positional embedding to use')
     parser.add_argument('--masks', action='store_true', help='train segmentation head if provided')
@@ -454,6 +517,19 @@ def parse_args(known=False):
 
     # 机器人设置
     parser.add_argument('--use_base', action='store_true', help='use robot base')
+    parser.add_argument(
+        '--gripper_minmax_norm',
+        
+        action='store_true',
+        help='ACT: 用全部 episode 的 qpos 夹爪维真实 min/max 覆盖 state 的 mean/std（约映射到 [-1,1]）',
+    )
+    parser.add_argument(
+        '--gripper_binary',
+        action='store_true',
+        help='夹爪处理: 1) 用 1%%/99%% 百分位作为 [min,max] 将 raw 值 remap 到 [0,1]; '
+             '2) 以 0.5 为阈值二值化为 0(张开)/1(闭合); '
+             '3) 归一化到 [-1,+1] 送入网络。优先于 --gripper_minmax_norm',
+    )
 
     # ACT模型专用设置
     parser.add_argument('--enc_layers', type=int, default=4, help='number of encoder layers')
@@ -461,7 +537,7 @@ def parse_args(known=False):
     parser.add_argument('--nheads', type=int, default=8, help='number of attention heads')
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate in transformer layers')
     parser.add_argument('--pre_norm', action='store_true', help='use pre-normalization in transformer')
-    parser.add_argument('--states_dim', type=int, default=14, help='state dimension size')
+    parser.add_argument('--states_dim', type=int, default=16, help='state dimension size')
     parser.add_argument('--kl_weight', type=int, default=10, help='KL divergence weight')
     parser.add_argument('--dim_feedforward', type=int, default=3200, help='feedforward network dimension')
     parser.add_argument('--temporal_agg', type=bool, default=True, help='use temporal aggregation')
@@ -476,7 +552,7 @@ def parse_args(known=False):
     # 图像设置
     parser.add_argument('--use_depth_image', action='store_true', help='use depth images')
 
-    # 状态和动作设置
+    # 状态和动作设置（ACT 本体固定为 Flexiv 16 维，见 FLEXIV_JOINTS_PER_ARM）
     parser.add_argument('--arm_delay_time', type=int, default=0, help='arm delay time in milliseconds')
     parser.add_argument('--use_qvel', action='store_true', help='include qvel in state information')
     parser.add_argument('--use_effort', action='store_true', help='include effort data in state')
